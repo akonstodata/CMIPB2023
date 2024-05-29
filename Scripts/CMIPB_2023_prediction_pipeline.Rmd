@@ -1,0 +1,403 @@
+---
+title: "CMIPB_2023"
+author: "Anna Konstorum"
+date: "2023-12-02"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load libraries}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(nipalsMCIA)
+library(glmnet)
+library(readr)
+#library(formattable)
+```
+
+# Many of the functions in the source file and in this script
+# have been modified from the templates provided by the CMIPB team
+
+```{r load custom functions}
+source("CMIPB_2023_functions.R")
+```
+
+# Prepare dates/variables of interest
+```{r variables}
+DATASET <- c("2020_dataset", "2021_dataset")
+TIMEPOINTS <- c(0, 1, 3, 14)
+#dataFile <- "combined_dataset2020_2021.csv"
+
+META_COLS <- c("specimen_id", "subject_id", "timepoint", "dataset", 
+               "biological_sex", "infancy_vac", "age_at_boost")
+ABTITER_COLS <- c("IgG_PT")
+RNA_COLS <- c("CCL3")
+CELL_COLS <- c("Monocytes")
+
+DEMOGRAPHY_COLS <- c("age_at_boost", "biological_sex", "infancy_vac")
+
+TASK_COLS <- c("Monocytes_D1", "CCL3_D3", "IgG_PT_D14")
+TASKS_BASELINES <- c("Monocytes_D0", "CCL3_D0", "IgG_PT_D0")
+BASE_COLS <- c("Monocytes_D0", "IgG_PT_D0", "CCL3_D0")
+
+LOG_TRANS_COLS <- c("CCL3_D0", "IgG_PT_D0",
+                    "CCL3_D3",  "IgG_PT_D14")
+output_request = list("DATASET" = DATASET, "TIMEPOINTS" = TIMEPOINTS, "META_COLS" = META_COLS,
+                   "ABTITER_COLS" = ABTITER_COLS, "RNA_COLS" = RNA_COLS, "CELL_COLS" = CELL_COLS,
+                   "DEMOGRAPHCY_COLS" = DEMOGRAPHY_COLS, "TASK_COLS" = TASK_COLS,
+                   "TASKS_BASELINES" = TASKS_BASELINES, "BASE_COLS" = BASE_COLS, 
+                   "LOG_TRANS_COLS" = LOG_TRANS_COLS)
+```
+
+```{r load training data}
+df_pr <- readRDS("master_processed_training_data.RDS")
+```
+
+## Extract data associated with outcome variables from training data
+```{r combine_experiments}
+df_pr_all <- combine_exps(df_pr, output_request)
+df_pr_all <- fold_change(df_pr_all) 
+```
+
+## Prepare training data for model
+```{r prepare_training_data}
+
+# Filter metadata to baseline data
+metaDf <- data.frame(df_pr[["subject_specimen"]])
+metaDf["age_at_boost"] <- as.numeric(round(difftime(metaDf$date_of_boost, metaDf$year_of_birth,units="weeks")/52, 2))
+metaDf <- metaDf[, output_request$META_COLS] %>%
+          data.frame()
+# meta_baseline
+metaDf_base <- metaDf[metaDf['timepoint']==0,]
+
+# For this submission, decided to only use 2021 data for training
+# Should test with the batch-corrected 2020 + 2021 data
+metaDf_base <- metaDf_base[metaDf_base['dataset']=='2021_dataset',]
+metaDf_test <- metaDf[metaDf$timepoint %in% c(0,1,3,14),]
+```
+
+```{r}
+# Extract associated speciman_ids from each dataset
+abtiterDf <- df_pr[["abtiter_wide"]]$normalized_data %>%
+    t() %>%
+    data.frame() 
+rnaDf <- df_pr[["pbmc_gene_expression"]]$raw_data %>%
+    t() %>%
+    data.frame() 
+cellDf <- df_pr[["pbmc_cell_frequency"]]$normalized_data %>%
+    t() %>%
+    data.frame()
+cytDf <- df_pr[["plasma_cytokine_concentrations"]]$normalized_data %>%
+    t() %>%
+    data.frame()
+```
+
+```{r, find_intersect}
+# Find subjects with all four omics
+# This step can be made more efficient
+metaDf_base_cyt<-metaDf_base[metaDf_base$specimen_id %in% row.names(cytDf),]
+metaDf_base_12<-metaDf_base_cyt[metaDf_base_cyt$specimen_id %in% row.names(abtiterDf),]
+metaDf_base_123<-metaDf_base_12[metaDf_base_12$specimen_id %in% row.names(rnaDf),]
+metaDf_base_1234<-metaDf_base_123[metaDf_base_123$specimen_id %in% row.names(cellDf),]
+
+keep<-metaDf_base_1234[['specimen_id']]
+
+# Subset each omics to baseline data for subjects in intersection and save as list
+cytDf_base<-subset(cytDf, subset=rownames(cytDf) %in% keep)
+abtiterDf_base<-subset(abtiterDf, subset=rownames(abtiterDf) %in% keep)
+rnaDf_base<-subset(rnaDf, subset=rownames(rnaDf) %in% keep)
+cellDf_base<-subset(cellDf, subset=rownames(cellDf) %in% keep)
+
+rownames(abtiterDf_base)<-rownames(cytDf_base)<-rownames(rnaDf_base)<-rownames(cellDf_base)<-metaDf_base_1234[['subject_id']]
+
+# After a few cross-validation experiments, found good performance using these three omics
+# Can test with including back cellDf
+base_data<-list(cyt=cytDf_base,ab=abtiterDf_base, seq=rnaDf_base) # cell=cellDf_base
+```
+
+# Run nipalsMCIA
+```{r}
+
+# Used r=10 factors, can add more factors in future experiments
+base_data_mae <- simple_mae(base_data,row_format="sample")
+set.seed(42)
+mcia_base <- nipals_multiblock(base_data_mae,
+                               col_preproc_method = "colprofile",
+                               num_PCs = 10, tol = 1e-12, plots='none')
+```
+
+### Add demographic and baseline features to MCIA factor model to create MCIAplus model (gs_full)
+```{r}
+gs_full_temp <- mcia_base@global_scores
+df_pr_all_prep<-subset(df_pr_all,subset=rownames(df_pr_all) %in% rownames(gs_full_temp))
+df_pr_all_prep_base<-df_pr_all_prep[,c("biological_sex", "infancy_vac", "age_at_boost",
+                                "IgG_PT_D0","Monocytes_D0","CCL3_D0")]
+df_pr_all_prep_base['biological_sex'] <- as.numeric(as.factor(df_pr_all_prep_base$biological_sex))-1
+df_pr_all_prep_base['infancy_vac'] <- as.numeric(as.factor(df_pr_all_prep_base$infancy_vac))-1
+
+
+gs_full <- cbind(gs_full_temp,df_pr_all_prep_base)
+train_tasks<-df_pr_all_prep[,c("IgG_PT_D14","IgG_PT_D14_FC",
+                               "Monocytes_D1", "Monocytes_D1_FC",
+                               "CCL3_D3", "CCL3_D3_FC")]
+```
+
+### Test model quality
+
+```{r}
+
+gs_full_filt<-na.omit(gs_full)
+
+# Full model
+gs_full_filt2<-gs_full_filt
+pred_cor_full<-pred_cor_calc(gs_full_filt2,train_tasks)
+
+# MCIA model
+gs_full_filt2<-gs_full_filt[,c("1","2","3","4","5","6","7","8","9","10")]
+pred_cor_mcia <- pred_cor_calc(gs_full_filt2,train_tasks)
+
+# Day0/demographic model
+gs_full_filt2<-gs_full_filt[,c('biological_sex','infancy_vac','age_at_boost','IgG_PT_D0','Monocytes_D0','CCL3_D0')]
+pred_cor_clin <- pred_cor_calc(gs_full_filt2,train_tasks)
+
+colnames(pred_cor_full) <- c("full")
+colnames(pred_cor_mcia)<- c("MCIA")
+colnames(pred_cor_clin)<- c("clin")
+
+pred_cor_all<-cbind(pred_cor_full,pred_cor_mcia,pred_cor_clin)
+pred_cor_all <- pred_cor_all %>%
+  mutate(max = pmax(full, MCIA, clin, na.rm = TRUE))
+
+# Decide which model to use for the predictions based on maximum correlation value
+pred_cor_all$use<-c("clin","clin","full","none","clin","full")
+
+```
+
+### For each model, can assess which features contribute to non-zero coefficients
+```{r}
+# Using clinical model
+gs_full_filt2<-gs_full_filt[,c('biological_sex','infancy_vac','age_at_boost','IgG_PT_D0','Monocytes_D0','CCL3_D0')]
+train_tasks_clin<-train_tasks[,c("IgG_PT_D14", "IgG_PT_D14_FC","CCL3_D3")]
+top_feat_clin<-top_feat_model(gs_full_filt2,train_tasks_clin)
+
+# Using full model
+gs_full_filt2<-gs_full_filt
+train_tasks_full<-train_tasks[,c("Monocytes_D1","CCL3_D3_FC")]
+top_feat_full<-top_feat_model(gs_full_filt2, train_tasks_full)
+
+
+```
+
+```{r load testing data}
+df_pr_test <- readRDS("master_processed_prediction_data.RDS")
+```
+
+```{r prepare_test_data}
+
+# Filter metadata
+metaDf_test <- data.frame(df_pr_test[["subject_specimen"]])
+metaDf_test["age_at_boost"] <- as.numeric(round(difftime(metaDf_test$date_of_boost, metaDf_test$year_of_birth,units="weeks")/52, 2))
+metaDf_test <- metaDf_test[, META_COLS] %>%
+          data.frame()
+# meta_baseline
+metaDf_test_base <- metaDf_test[metaDf_test['timepoint']==0,]
+metaDf_test_base <- metaDf_test_base[metaDf_test_base['dataset']=='2022_dataset',]
+metaDf_test_base <- metaDf_test_base[metaDf_test_base$timepoint %in% c(0,1,3,14),]
+```
+
+```{r}
+# Extract associated specimen ids from each dataset
+
+abtiterDf_test <- df_pr_test[["abtiter"]]$processed_similar_to_training %>%
+    t() %>%
+    data.frame() 
+rnaDf_test <- df_pr_test[["pbmc_gene_expression"]]$processed_similar_to_training %>%
+    t() %>%
+    data.frame() 
+cellDf_test <- df_pr_test[["pbmc_cell_frequency"]]$processed_similar_to_training %>%
+    t() %>%
+    data.frame()
+cytDf_test <- df_pr_test[["plasma_cytokine_concentrations"]]$processed_similar_to_training %>%
+    t() %>%
+    data.frame()
+```
+
+```{r, find_intersect}
+# Find intersection for specimen ids containing all omics and combine the omics data into a list
+metaDf_test_base_cyt<-metaDf_test_base[metaDf_test_base$specimen_id %in% row.names(cytDf_test),]
+metaDf_test_base_12<-metaDf_test_base_cyt[metaDf_test_base_cyt$specimen_id %in% row.names(abtiterDf_test),]
+metaDf_test_base_123<-metaDf_test_base_12[metaDf_test_base_12$specimen_id %in% row.names(rnaDf_test),]
+metaDf_test_base_1234<-metaDf_test_base_123[metaDf_test_base_123$specimen_id %in% row.names(cellDf_test),]
+
+keep<-metaDf_test_base_1234[['specimen_id']]
+
+cytDf_test_base<-subset(cytDf_test, subset=rownames(cytDf_test) %in% keep)
+cytDf_test_base<-cytDf_test_base[colnames(cytDf_base)]
+# Zero out na values
+cytDf_test_base[is.na(cytDf_test_base)] <- 0
+
+abtiterDf_test_base<-subset(abtiterDf_test, subset=rownames(abtiterDf_test) %in% keep)
+abtiterDf_test_base<-abtiterDf_test_base[colnames(abtiterDf_base)]
+
+rnaDf_test_base<-subset(rnaDf_test, subset=rownames(rnaDf_test) %in% keep)
+rnaDf_test_base<-rnaDf_test_base[colnames(rnaDf_base)]
+
+cellDf_test_base<-subset(cellDf_test, subset=rownames(cellDf_test) %in% keep)
+cellDf_test_base<-cellDf_test_base[colnames(cellDf_base)]
+
+rownames(abtiterDf_test_base)<-rownames(cytDf_test_base)<-rownames(rnaDf_test_base)<-rownames(cellDf_test_base)<-metaDf_test_base_1234[['subject_id']]
+
+base_test_data<-list(cyt=cytDf_test_base,ab=abtiterDf_test_base, seq=rnaDf_test_base) # cell=cellDf_base
+```
+
+# Use MCIA model built on training data to build new model
+```{r}
+base_test_data_mae <- simple_mae(base_test_data,row_format="sample")
+gs_full_new_temp <- predict_gs(mcia_results = mcia_base,
+                               test_data = base_test_data_mae)
+```
+
+## Extract data associated with outcome variables from test data
+```{r}
+df_pr_test_all <- combine_exps_test(df_pr_test)
+rownames(df_pr_test_all)<-df_pr_test_all$subject_id
+```
+
+```{r}
+# Create test data structures in the same way to training to feed into models
+
+# gs_test_full includes new MCIA scores as well as demographic/day0 factors
+# Does not include data for subjects 97 and 105 as they were missing an omic
+# If this omic imputed, can include in future
+df_pr_test_all_prep<-subset(df_pr_test_all,subset=rownames(df_pr_test_all) %in% rownames(gs_full_new_temp))
+df_pr_test_all_prep_base<-df_pr_test_all_prep[,c("biological_sex", "infancy_vac", "age_at_boost",
+                                "IgG_PT_D0","Monocytes_D0","CCL3_D0")]
+df_pr_test_all_prep_base['biological_sex'] <- as.numeric(as.factor(df_pr_test_all_prep_base$biological_sex))-1
+df_pr_test_all_prep_base['infancy_vac'] <- as.numeric(as.factor(df_pr_test_all_prep_base$infancy_vac))-1
+gs_test_full <- cbind(gs_full_new_temp,df_pr_test_all_prep_base)
+
+# Data only from demographic/day0 variables, includes subjects 97 and 105
+df_pr_test_all_prep_b<-df_pr_test_all
+df_pr_test_all_prep_base_b<-df_pr_test_all_prep_b[,c("biological_sex", "infancy_vac", "age_at_boost",
+                                "IgG_PT_D0","Monocytes_D0","CCL3_D0")]
+df_pr_test_all_prep_base_b['biological_sex'] <- as.numeric(as.factor(df_pr_test_all_prep_base_b$biological_sex))-1
+df_pr_test_all_prep_base_b['infancy_vac'] <- as.numeric(as.factor(df_pr_test_all_prep_base_b$infancy_vac))-1
+gs_test_full_clin<-df_pr_test_all_prep_base_b
+
+# Training data
+gs_full_filt<-na.omit(gs_full)
+gs_full_filt_clin<-gs_full_filt[,c('biological_sex','infancy_vac','age_at_boost','IgG_PT_D0','Monocytes_D0','CCL3_D0')]
+
+```
+
+
+
+```{r}
+#gs_full_filt<-na.omit(gs_full)
+#gs_full_filt_clin<-gs_full_filt[,c('biological_sex','infancy_vac','age_at_boost','IgG_PT_D0','Monocytes_D0','CCL3_D0')]
+
+#gs_test_full_clin<-gs_test_full[,c('biological_sex','infancy_vac','age_at_boost','IgG_PT_D0','Monocytes_D0','CCL3_D0')]
+
+# missing 97 and 105
+#gs_test_full_clin<-df_pr_test_all_prep_base_b
+
+```
+
+```{r}
+# Make predictions!
+# pred_cor_calc_test takes in:
+# (1) the take name
+# (2) the training model, this is decided by the results in the pred_cor_all dataframe
+# if the 'use' column indicates 'clin', then use the 'gs_full_filt_clin' training data, 
+# and the 'gs_test_full_clin' test data
+# if the 'use' column indicates 'full', then use the 'gs_full_filt' training data
+# and the 'gs_test_full' test data; note this data is missing input for two subjects,
+# so the predictions will be added in a later chunk
+
+# 'use'=='clin'
+task = "IgG_PT_D14"
+IGG_D14<-pred_cor_calc_test(task,gs_full_filt_clin,gs_test_full_clin)
+
+task = "IgG_PT_D14_FC"
+IGG_FC<-pred_cor_calc_test(task,gs_full_filt_clin,gs_test_full_clin)
+
+task = "CCL3_D3"
+CCL3_D3<-pred_cor_calc_test(task,gs_full_filt_clin,gs_test_full_clin)
+
+# 'use'== 'full'
+task = "Monocytes_D1"
+M_D1 <-pred_cor_calc_test(task,gs_full_filt,gs_test_full)
+
+task = "CCL3_D3_FC"
+CCL3_D3_FC <-pred_cor_calc_test(task,gs_full_filt,gs_test_full)
+```
+
+```{r}
+# In order to get the rankings for the two missing subjects for Monocytes_D1 and 
+# CCL3_D3_FC, we will use the rankings from the associated Day 0 values
+targetX <- c("Monocytes_D0", "CCL3_D0")
+df_pr_test_all_rank <- df_pr_test_all
+df_pr_test_all_rank[, ranked_cols_base] <- apply(df_pr_test_all_rank[, targetX],2,rankingFunction)
+```
+
+# Start to combine results
+```{r}
+# Combine outputs of models only using day0/demographic data into one dataframe
+# This dataframe contains all subjects
+clin_all<-cbind(IGG_D14,IGG_FC,CCL3_D3)
+colnames(clin_all)<-c("IgG-PT-D14-titer","IgG-PT-D14-FC","CCL3-D3")
+clin_all_rank<-clin_all
+ranked_cols<-paste(colnames(clin_all),"Rank",sep="_")
+clin_all_rank[, ranked_cols] <- apply(clin_all_rank[, colnames(clin_all)],2,rankingFunction)
+```
+
+```{r}
+# Combine output of full models into one dataframe
+# This is missing rankings for two subjects
+full_all<-cbind(M_D1, CCL3_D3_FC)
+colnames(full_all)<-c("Monocytes-D1","CCL3-D3-FC")
+full_all_rank<-full_all
+ranked_cols<-paste(colnames(full_all),"Rank",sep="_")
+full_all_rank[, ranked_cols] <- apply(full_all_rank[, colnames(full_all)],2,rankingFunction)
+```
+
+```{r}
+submission_template = read_tsv("2ndChallengeSubmissionTemplate.tsv")
+
+clin_all_rank$subject<-rownames(clin_all_rank)
+full_all_rank$subject<-rownames(full_all_rank)
+final_out<-merge(clin_all_rank,by="subject",full_all_rank,all=T)
+
+# Add prediction rankings using day 0 values for the two subjects
+# who did not have cytof but for the test variables where the model needed it
+final_out[final_out$subject==105,"Monocytes-D1_Rank"] = df_pr_test_all_rank[df_pr_test_all_rank$subject_id==105,"Monocytes_D0_Rank"]
+
+final_out[final_out$subject==105,"CCL3-D3-FC_Rank"] = df_pr_test_all_rank[df_pr_test_all_rank$subject_id==105,"CCL3_D0_Rank"]
+
+final_out[final_out$subject==97,"Monocytes-D1_Rank"] = df_pr_test_all_rank[df_pr_test_all_rank$subject_id==97,"Monocytes_D0_Rank"]
+
+final_out[final_out$subject==97,"CCL3-D3-FC_Rank"] = df_pr_test_all_rank[df_pr_test_all_rank$subject_id==97,"CCL3_D0_Rank"]
+
+rownames(final_out)<-as.numeric(final_out$subject)
+
+reord<-match(submission_template$`Subject ID`,rownames(final_out))
+final_out<-final_out[reord,]
+```
+
+# Submit!
+```{r}
+submission_template$`1.1) IgG-PT-D14-titer-Rank`<-final_out$`IgG-PT-D14-titer_Rank`
+submission_template$`1.2) IgG-PT-D14-FC-Rank`<-final_out$`IgG-PT-D14-FC_Rank`
+submission_template$`2.1) Monocytes-D1-Rank`<-final_out$`Monocytes-D1_Rank`
+submission_template$`3.1) CCL3-D3-Rank`<-final_out$`CCL3-D3_Rank`
+submission_template$`3.2) CCL3-D3-FC-Rank`<-final_out$`CCL3-D3-FC_Rank`
+```
+
+```{r}
+write.table(submission_template,'submission_output.tsv',quote=FALSE,sep="\t",
+            row.names=FALSE, na="")
+```
